@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python Cache
+__pycache__/
+*.py[cod]
+
+# Personal Data (Databases)
+memory.json
+contacts.json
+system_state.json
+
+# Logs & Temporary Files
+jarvis.log
+speech_buffer.mp3
+*.log
+*.png
+*.csv
+
+# Virtual Environment (If you use one)
+venv/
+env/
