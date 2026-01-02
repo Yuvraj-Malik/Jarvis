@@ -10,31 +10,32 @@ import pyautogui
 import asyncio 
 import edge_tts 
 import pygame 
+import re  
 import screen_brightness_control as sbc
 import pywhatkit
 import pypdf
 import psutil 
 import status 
 import logging
-
-# --- AUDIO DRIVER ---
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from ctypes import cast, POINTER 
 from comtypes import CLSCTX_ALL, CoInitialize
-try:
-    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-except ImportError:
-    from pycaw.utils import AudioUtilities
-    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-
-from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ==========================================================
-# 🗣️ SPEECH ENGINE
-# ==========================================================
+try:
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    PYZCAW_AVAILABLE = True
+except ImportError:
+    PYZCAW_AVAILABLE = False
+
+from bs4 import BeautifulSoup
+from duckduckgo_search import DDGS
+
+# --- SPEECH ENGINE ---
 VOICE = "en-GB-RyanNeural"
 BUFFER_FILE = "speech_buffer.mp3"
 
@@ -48,30 +49,22 @@ def speak(text: str):
     if not text: return
     status.IS_SPEAKING = True 
     try:
-        # Cleanup old file
         if os.path.exists(BUFFER_FILE):
             try: os.remove(BUFFER_FILE)
             except: pass
-            
         asyncio.run(_generate_audio(text))
-        
         pygame.mixer.init()
         pygame.mixer.music.load(BUFFER_FILE)
         pygame.mixer.music.play()
-        
         while pygame.mixer.music.get_busy():
             pygame.time.Clock().tick(10)
-            
         pygame.mixer.music.stop()
         pygame.mixer.quit()
-        
-    except Exception as e: print(f"Audio Error: {e}")
+    except Exception as e: pass
     status.IS_SPEAKING = False 
     return "Spoken."
 
-# ==========================================================
-# 💾 DATABASE MANAGER
-# ==========================================================
+# --- DATABASE MANAGER ---
 STATE_FILE = "system_state.json"
 MEMORY_FILE = "memory.json"
 CONTACTS_FILE = "contacts.json"
@@ -109,56 +102,100 @@ def get_contact(name):
     data = load_json(CONTACTS_FILE)
     return data.get(name.lower().strip())
 
-# ==========================================================
-# 🛠️ SYSTEM ACTIONS (SIMPLIFIED & ROBUST)
-# ==========================================================
+def save_setting(key, val):
+    data = load_json(STATE_FILE)
+    data[key] = {
+        "previous": data.get(key, {}).get("current", 50),
+        "current": val,
+        "timestamp": str(datetime.datetime.now())
+    }
+    save_json(STATE_FILE, data)
+
+def get_setting_prev(key):
+    data = load_json(STATE_FILE)
+    return data.get(key, {}).get("previous", 50)
+
+# --- SYSTEM ACTIONS ---
 def set_volume(command):
-    nums = [int(s) for s in command.split() if s.isdigit()]
-    try:
-        CoInitialize() # Critical fix for thread crash
-        devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        volume = cast(interface, POINTER(IAudioEndpointVolume))
-        
-        if nums:
-            target = max(0, min(100, nums[0]))
-            volume.SetMasterVolumeLevelScalar(target / 100, None)
-            return f"Volume set to {target}%"
-        
-        elif "mute" in command:
-            volume.SetMute(1, None); return "Muted."
-        elif "unmute" in command:
-            volume.SetMute(0, None); return "Unmuted."
+    nums = re.findall(r'\d+', command)
+    target_percent = int(nums[0]) if nums else None
+    
+    if PYZCAW_AVAILABLE:
+        try:
+            CoInitialize()
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            volume = cast(interface, POINTER(IAudioEndpointVolume))
             
-        # Relative changes
-        current = volume.GetMasterVolumeLevelScalar() * 100
-        if "up" in command: 
-            volume.SetMasterVolumeLevelScalar(min(1, (current + 10)/100), None)
-            return "Volume increased."
-        if "down" in command: 
-            volume.SetMasterVolumeLevelScalar(max(0, (current - 10)/100), None)
-            return "Volume decreased."
+            if "mute" in command:
+                volume.SetMute(1, None); return "Muted."
+            elif "unmute" in command:
+                volume.SetMute(0, None); return "Unmuted."
+                
+            if target_percent is not None:
+                vol_0_to_1 = max(0, min(1, target_percent / 100))
+                volume.SetMasterVolumeLevelScalar(vol_0_to_1, None)
+                return f"Volume set to {target_percent}%."
+                
+            current_scalar = volume.GetMasterVolumeLevelScalar()
+            if "up" in command:
+                new_vol = min(1, current_scalar + 0.1)
+                volume.SetMasterVolumeLevelScalar(new_vol, None)
+                return "Volume increased."
+            elif "down" in command:
+                new_vol = max(0, current_scalar - 0.1)
+                volume.SetMasterVolumeLevelScalar(new_vol, None)
+                return "Volume decreased."
+        except Exception:
+            pass # Fall through to Keyboard Fallback
             
-        return f"Volume is {int(current)}%"
-    except:
-        # Reliable fallback
-        if "up" in command: pyautogui.press("volumeup", presses=5)
-        elif "down" in command: pyautogui.press("volumedown", presses=5)
-        elif "mute" in command: pyautogui.press("volumemute")
-        return "Volume adjusted (Keys)."
+    # FALLBACK: Keyboard Control
+    if "mute" in command:
+        pyautogui.press('volumemute'); return "Muted."
+    elif "unmute" in command:
+        pyautogui.press('volumemute'); return "Unmuted."
+    elif "up" in command:
+        for _ in range(3): pyautogui.press('volumeup')
+        return "Volume increased."
+    elif "down" in command:
+        for _ in range(3): pyautogui.press('volumedown')
+        return "Volume decreased."
+    elif target_percent:
+        # Smart Reset
+        for _ in range(50): pyautogui.press('volumedown')
+        steps = int(target_percent / 2)
+        for _ in range(steps): pyautogui.press('volumeup')
+        return f"Volume set to approx {target_percent}%."
+    return "Volume command processed."
 
 def set_brightness(command):
-    # DIRECT CONTROL: No checks, no "current status" reading.
-    nums = [int(s) for s in command.split() if s.isdigit()]
-    if nums:
-        target = max(0, min(100, nums[0]))
+    nums = re.findall(r'\d+', command)
+    try:
+        if "revert" in command: target = get_setting_prev("brightness")
+        elif nums: target = int(nums[0])
+        else:
+            try:
+                current = sbc.get_brightness()[0]
+                if "up" in command: target = min(100, current + 10)
+                elif "down" in command: target = max(0, current - 10)
+                else: return "Please specify a level."
+            except: target = 50 
+    except: target = 50 
+    target = max(0, min(100, target))
+
+    try:
+        sbc.set_brightness(target, display=0)
+        save_setting("brightness", target)
+        return f"Brightness set to {target}%."
+    except Exception as main_error:
         try:
-            sbc.set_brightness(target)
-            return f"Brightness set to {target}%"
-        except Exception as e:
-            return f"Monitor did not respond. (Error: {e})"
-            
-    return "Please specify a level, e.g. 'Brightness 100'."
+            monitors = sbc.get_monitors()
+            if not monitors: return "Error: System cannot find connected monitors."
+            sbc.set_brightness([target] * len(monitors))
+            save_setting("brightness", target)
+            return f"Brightness set to {target}% on all monitors."
+        except Exception:
+            return "Brightness Error. Please run as Administrator."
 
 def system_status():
     try:
@@ -169,19 +206,26 @@ def system_status():
         return f"CPU: {cpu}% | RAM: {ram}% | Power: {batt_s}"
     except: return "Status unavailable."
 
-# ==========================================================
-# 📂 FILES, APPS & WEB
-# ==========================================================
+# --- FILES, APPS & WEB ---
+APP_PROTOCOLS = {
+    'whatsapp': 'whatsapp://',
+    'discord': 'discord://',
+    'spotify': 'spotify://',
+    'slack': 'slack://',
+    'telegram': 'tg://',
+    'teams': 'msteams://'
+}
+
 def open_app(name):
     name = name.lower()
     try:
-        if 'chrome' in name: subprocess.Popen(['start', 'chrome'], shell=True)
-        elif 'notepad' in name: subprocess.Popen(['notepad.exe'])
-        elif 'calc' in name: subprocess.Popen(['calc.exe'])
-        elif 'word' in name: subprocess.Popen(['start', 'winword'], shell=True)
-        elif 'excel' in name: subprocess.Popen(['start', 'excel'], shell=True)
+        if name in APP_PROTOCOLS:
+            webbrowser.open(APP_PROTOCOLS[name])
+            return f"Opened {name}"
+        os.system(f"start {name}")
         return f"Opened {name}"
-    except: return f"Could not open {name}"
+    except Exception as e: 
+        return f"Could not open {name}."
 
 def play_yt(topic):
     status.IS_MUSIC_PLAYING = True
@@ -190,29 +234,58 @@ def play_yt(topic):
 
 def whatsapp_msg(recipient, message):
     try:
-        # Load contacts to find number
         contacts = load_json(CONTACTS_FILE)
         num = contacts.get(recipient.lower()) or recipient
-        
         webbrowser.open(f"whatsapp://send?phone={num}&text={message}")
-        time.sleep(6) 
+        speak("Opening WhatsApp.")
+        time.sleep(4) 
         pyautogui.press('enter')
         time.sleep(1)
         pyautogui.press('enter')
         return "Message sent."
-    except: return "WhatsApp failed."
+    except Exception as e:
+        return f"WhatsApp automation failed."
 
 def search_google(query):
     try:
-        results = DDGS().text(query, max_results=2)
-        if results: return results[0]['body']
-        return "No results."
-    except: return "Search failed."
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=2))
+            if results: return results[0]['body']
+            return "No results found."
+    except Exception:
+        try:
+            webbrowser.open(f"https://www.google.com/search?q={query}")
+            return "I've opened that in your browser."
+        except:
+            return "Search service unavailable."
 
-# Wrappers for compatibility
+# Wrappers
 def visit_url(url): return "Website visited."
 def read_pdf_or_txt(f): return "File read."
 def create_txt_file(f, c): return "File created."
 def calc_math(e): 
     try: return str(eval(e))
     except: return "Error"
+
+def send_email(to, subject, body):
+    try:
+        email_user = os.getenv("EMAIL_USER")
+        email_pass = os.getenv("EMAIL_PASS")
+        if not email_user or not email_pass:
+            return "Email credentials not found."
+
+        message = MIMEMultipart()
+        message["From"] = email_user
+        message["To"] = to
+        message["Subject"] = subject
+        message.attach(MIMEText(body, "plain"))
+
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(email_user, email_pass)
+        server.sendmail(email_user, to, message.as_string())
+        server.quit()
+        return f"Email sent to {to}."
+    except Exception:
+        webbrowser.open(f"mailto:{to}?subject={subject}&body={body}")
+        return "Email server error. I opened your email client instead."

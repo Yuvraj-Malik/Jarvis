@@ -19,7 +19,13 @@ class JarvisOverlay(QWidget):
         # Transparent, Top-Most, Frameless Window
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setGeometry(1400, 100, 400, 400) # Position on screen
+        screen = QApplication.primaryScreen().availableGeometry()
+        width = 400
+        height = 400
+        # Position: Right side of screen, but ensure it fits
+        x = screen.width() - width - 50 
+        y = 100
+        self.setGeometry(x, y, width, height)
         
         # Layout & Label
         self.layout = QVBoxLayout()
